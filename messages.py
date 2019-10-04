@@ -1,0 +1,99 @@
+import base58
+import threading
+import types
+from time import sleep, time
+
+from utilities import de_segment, naturalsize
+
+MAGIC = b"http  "
+
+def valid_base58check(data):
+    try:
+        base58.b58decode_check(data)
+        print("Base58 encoded data detected")
+        return True
+    except Exception:
+        print("Base58 encoded data check failed!")
+        return False
+
+def handle_message(conn, message):
+    """
+    Handle messages received over the mesh network
+    :param conn: the lntenna.gotenna.Connection instance
+    :param message: as strings
+    :return: result of message handling
+    """
+    payload = message.payload.message
+
+    # test for jumbo:
+    jumbo = True if payload.startswith("sm/") else False
+    if jumbo:
+        handle_jumbo_message(conn, message)
+        return
+    if valid_base58check(payload):
+        conn.bytes_received += len(payload)
+        conn.log(f"Total bytes received: {naturalsize(conn.bytes_received)}")
+        try:
+            payload_bytes = base58.b58decode_check(payload)
+            if payload_bytes.startswith(MAGIC):
+                print("magic message received!")
+                original_payload = payload_bytes[6:]
+                conn.events.socket_queue.put(original_payload)
+            print(payload_bytes[:6])
+        except Exception as e:
+            print(f"Error decoding data in handle_message:\n{e}")
+    else:
+        print(payload)
+
+
+def handle_jumbo_message(conn, message):
+    payload = message.payload.message
+    # TODO: this cuts out all sender and receiver info -- ADD SENDER GID
+    conn.log(f"Received jumbo message fragment")
+    prefix, seq, length, msg = payload.split("/")
+    if conn.jumbo_thread.is_alive():
+        pass
+    else:
+        # start the jumbo monitor thread
+        conn.events.jumbo_len = length
+        conn.jumbo_thread = None
+        conn.jumbo_thread = threading.Thread(
+            target=monitor_jumbo_msgs, daemon=True, args=[conn]
+        )
+        conn.jumbo_thread.start()
+    conn.events.jumbo.append(payload)
+    return
+
+
+def monitor_jumbo_msgs(conn, timeout=210):
+    conn.log("Starting jumbo message monitor thread")
+    start = time()
+    missing = True
+    while True and time() < start + timeout:
+        # conn.log(
+        #     f"received: {len(conn.events.jumbo)} of {conn.events.jumbo_len} "
+        #     f"jumbo messages"
+        # )
+        if (
+            len(conn.events.jumbo) == int(conn.events.jumbo_len)
+            and len(conn.events.jumbo) is not 0
+        ):
+            missing = False
+            # give handle_message the attributes it expects
+            jumbo_message = types.SimpleNamespace()
+            jumbo_message.payload = types.SimpleNamespace()
+            # reconstruct the jumbo message
+            jumbo_message.payload.message = de_segment(conn.events.jumbo)
+            # send it back through handle_message
+            conn.log(f"Jumbo message payload reconstituted")
+            handle_message(conn, jumbo_message)
+            break
+        sleep(0.2)
+    # reset jumbo events after timeout
+    conn.events.init_jumbo()
+    if missing:
+        conn.log(
+            "Did not receive all jumbo messages require for re-assembly. "
+            "Please request the message again from the remote host."
+        )
+    return
